@@ -1720,7 +1720,7 @@ impl VriprApp {
                 has_tracks: !self.tracks.is_empty(),
                 has_selection: !self.selected_rows.is_empty(),
                 has_discogs_release: self.discogs_release.is_some(),
-                has_analysis_wav: self.analysis_wav.as_ref().map(|p| p.exists()).unwrap_or(false),
+                has_analysis_wav: self.analysis_wav.is_some(),
                 available_sides: self.available_sides.clone(),
                 selected_side: self.selected_side,
             };

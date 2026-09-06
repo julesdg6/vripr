@@ -229,7 +229,10 @@ pub fn show_toolbar(ui: &mut Ui, state: &ToolbarState) -> Vec<ToolbarAction> {
             {
                 let enabled = state.has_analysis_wav && state.has_tracks && !state.is_busy;
                 let btn = ui.add_enabled(enabled, egui::Button::new("🔎 Identify Tracks"))
-                    .on_hover_text("Fingerprint detected tracks and review AcoustID/MusicBrainz matches before applying metadata");
+                    .on_hover_text(
+                        "Connect to Audacity, detect tracks, and configure AcoustID and MusicBrainz \
+                         credentials in Settings before fingerprinting tracks"
+                    );
                 if btn.clicked() {
                     actions.push(ToolbarAction::IdentifyTracks);
                 }
