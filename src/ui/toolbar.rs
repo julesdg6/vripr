@@ -64,6 +64,7 @@ pub enum ToolbarAction {
     Rescan,
     Samples,
     GetLabels,
+    IdentifyTracks,
     /// User changed the active vinyl side filter.
     SideChanged(Option<char>),
 }
@@ -223,6 +224,15 @@ pub fn show_toolbar(ui: &mut Ui, state: &ToolbarState) -> Vec<ToolbarAction> {
                 );
             if btn.clicked() {
                 actions.push(ToolbarAction::FetchDiscogsRelease);
+            }
+
+            {
+                let enabled = state.has_analysis_wav && state.has_tracks && !state.is_busy;
+                let btn = ui.add_enabled(enabled, egui::Button::new("🔎 Identify Tracks"))
+                    .on_hover_text("Fingerprint detected tracks and review AcoustID/MusicBrainz matches before applying metadata");
+                if btn.clicked() {
+                    actions.push(ToolbarAction::IdentifyTracks);
+                }
             }
         }
 
