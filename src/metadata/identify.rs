@@ -147,18 +147,34 @@ fn extract_segment_wav(
         .make(&track.codec_params, &DecoderOptions::default())
         .context("Could not create a decoder for the analysis audio")?;
 
+    // Seek close to the segment start so tracks late into a long recording
+    // don't require re-decoding everything before them for every call.
+    // Best-effort: if the format/codec doesn't support seeking, fall back to
+    // decoding from the beginning and skipping frames before start_frame below.
+    let seek_result = format.seek(
+        symphonia::core::formats::SeekMode::Accurate,
+        symphonia::core::formats::SeekTo::Time {
+            time: symphonia::core::units::Time::from(start_secs.max(0.0)),
+            track_id: Some(track_id),
+        },
+    );
+
     let start_frame = (start_secs * sample_rate as f64) as u64;
     let end_frame = start_frame + (length_secs * sample_rate as f64) as u64;
 
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
-    let mut frame_index: u64 = 0;
+    // `frame_index` tracks the absolute position of decoded frames. After a
+    // successful seek, decoding resumes at (approximately) start_frame rather
+    // than 0, so this is initialised accordingly; a failed/no-op seek leaves
+    // decoding starting at 0 and frames before start_frame are skipped below.
+    let mut frame_index: u64 = seek_result.map(|seeked| seeked.actual_ts).unwrap_or(0);
     let mut segment: Vec<f32> = Vec::new(); // interleaved, n_channels per frame
 
     'decode: loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SErr::IoError(_)) => break,
-            Err(SErr::ResetRequired) => break,
+            Err(SErr::ResetRequired) => { decoder.reset(); continue; }
             Err(e) => return Err(e.into()),
         };
         if packet.track_id() != track_id { continue; }
