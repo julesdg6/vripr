@@ -16,8 +16,23 @@ fn rejects_invalid_fpcalc_output() {
 
 #[test]
 fn reports_missing_fpcalc_actionably() {
+    let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(wav.path(), spec).unwrap();
+        for i in 0..44100 * 2 {
+            let v = ((i as f32 * 0.05).sin() * 1000.0) as i16;
+            writer.write_sample(v).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
     let error = fingerprint_segment(
-        "/definitely/not/fpcalc", std::path::Path::new("/tmp/audio.flac"), 0.0, 60.0,
+        "/definitely/not/fpcalc", wav.path(), 0.0, 1.0,
     ).unwrap_err();
     assert!(error.to_string().contains("Install Chromaprint"));
 }
