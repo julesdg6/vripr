@@ -159,54 +159,26 @@ fn extract_segment_wav(
         },
     );
 
-    let start_frame = (start_secs * sample_rate as f64) as u64;
-    let end_frame = start_frame + (length_secs * sample_rate as f64) as u64;
+    let requested_start_frame = (start_secs * sample_rate as f64) as u64;
+    let end_frame = requested_start_frame + (length_secs * sample_rate as f64) as u64;
 
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
     // `frame_index` tracks the absolute position of decoded frames. After a
-    // successful seek, decoding resumes at (approximately) start_frame rather
-    // than 0, so this is initialised accordingly; a failed/no-op seek leaves
-    // decoding starting at 0 and frames before start_frame are skipped below.
+    // successful seek, decoding resumes at (approximately) requested_start_frame
+    // rather than 0, so this is initialised accordingly; a failed/no-op seek
+    // leaves decoding starting at 0. `start_frame` is clamped to whatever
+    // position decoding actually resumes at, so a seek that lands slightly
+    // past the requested start (permitted for "Accurate" mode too, on some
+    // demuxers) doesn't silently drop the beginning of the segment.
     let mut frame_index: u64 = seek_result.map(|seeked| seeked.actual_ts).unwrap_or(0);
-    let mut segment: Vec<f32> = Vec::new(); // interleaved, n_channels per frame
-
-    'decode: loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(SErr::IoError(_)) => break,
-            Err(SErr::ResetRequired) => { decoder.reset(); continue; }
-            Err(e) => return Err(e.into()),
-        };
-        if packet.track_id() != track_id { continue; }
-        let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(SErr::DecodeError(_)) => continue,
-            Err(e) => return Err(e.into()),
-        };
-        let spec = *decoded.spec();
-        if sample_buf.is_none() {
-            sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-        }
-        let buf = sample_buf.as_mut().unwrap();
-        buf.copy_interleaved_ref(decoded);
-        for frame in buf.samples().chunks(n_channels) {
-            if frame_index >= end_frame { break 'decode; }
-            if frame_index >= start_frame {
-                segment.extend_from_slice(frame);
-            }
-            frame_index += 1;
-        }
-    }
-
-    if segment.is_empty() {
-        bail!("the analysis audio has no samples at this track's position");
-    }
+    let start_frame = requested_start_frame.max(frame_index).min(end_frame);
 
     let mut tmp = tempfile::Builder::new()
         .prefix("vripr_fp_")
         .suffix(".wav")
         .tempfile()
         .context("Could not create a temporary file for the track segment")?;
+    let mut wrote_any = false;
     {
         let spec = WavSpec {
             channels: n_channels as u16,
@@ -216,12 +188,46 @@ fn extract_segment_wav(
         };
         let mut writer = WavWriter::new(&mut tmp, spec)
             .context("Could not write the track segment WAV header")?;
-        for &s in &segment {
-            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            writer.write_sample(v)?;
+
+        'decode: loop {
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(SErr::IoError(_)) => break,
+                Err(SErr::ResetRequired) => { decoder.reset(); continue; }
+                Err(e) => return Err(e.into()),
+            };
+            if packet.track_id() != track_id { continue; }
+            let decoded = match decoder.decode(&packet) {
+                Ok(d) => d,
+                Err(SErr::DecodeError(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let spec = *decoded.spec();
+            if sample_buf.is_none() {
+                sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
+            }
+            let buf = sample_buf.as_mut().unwrap();
+            buf.copy_interleaved_ref(decoded);
+            for frame in buf.samples().chunks(n_channels) {
+                if frame_index >= end_frame { break 'decode; }
+                if frame_index >= start_frame {
+                    for &s in frame {
+                        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        writer.write_sample(v)?;
+                    }
+                    wrote_any = true;
+                }
+                frame_index += 1;
+            }
         }
+
         writer.finalize().context("Could not finalise the track segment WAV")?;
     }
+
+    if !wrote_any {
+        bail!("the analysis audio has no samples at this track's position");
+    }
+
     Ok(tmp)
 }
 
