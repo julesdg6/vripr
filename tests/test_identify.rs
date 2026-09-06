@@ -1,5 +1,6 @@
 use vripr::metadata::identify::{
-    duration_agreement, fingerprint_segment, parse_fpcalc_output, rank_score,
+    duration_agreement, extract_api_error, fingerprint_segment, format_http_error,
+    parse_fpcalc_output, rank_score,
 };
 
 #[test]
@@ -43,4 +44,16 @@ fn ranking_rewards_fingerprint_and_duration() {
     assert!(rank_score(0.9, 1.0, true) > rank_score(0.9, 1.0, false));
     assert_eq!(duration_agreement(180.0, Some(180.0)), 1.0);
     assert_eq!(duration_agreement(180.0, Some(220.0)), 0.0);
+}
+
+#[test]
+fn reports_acoustid_api_error_details() {
+    let payload = r#"{"status":"error","error":{"message":"API key is invalid","type":"invalid_api_key"}}"#;
+    let message = extract_api_error(payload).unwrap();
+    assert!(message.contains("API key is invalid"));
+    assert!(message.contains("invalid_api_key"));
+
+    let formatted = format_http_error(reqwest::StatusCode::FORBIDDEN, payload);
+    assert!(formatted.contains("403"));
+    assert!(formatted.contains("API key is invalid"));
 }

@@ -30,9 +30,20 @@ struct FpcalcOutput {
     fingerprint: String,
 }
 
+#[derive(Deserialize, Debug)]
+struct AcoustIdError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct AcoustIdResponse {
     status: String,
+    #[serde(default)]
+    error: Option<AcoustIdError>,
     #[serde(default)]
     results: Vec<AcoustIdResult>,
 }
@@ -240,6 +251,33 @@ pub fn parse_fpcalc_output(output: &[u8]) -> Result<Fingerprint> {
     Ok(Fingerprint { duration: fingerprint.duration, fingerprint: fingerprint.fingerprint })
 }
 
+pub fn extract_api_error(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let direct_message = value.get("message").and_then(serde_json::Value::as_str);
+    if let Some(message) = direct_message {
+        return Some(message.to_owned());
+    }
+
+    let error = value.get("error").and_then(serde_json::Value::as_object)?;
+    let message = error.get("message").and_then(serde_json::Value::as_str);
+    let kind = error.get("type").and_then(serde_json::Value::as_str);
+    match (message, kind) {
+        (Some(message), Some(kind)) => Some(format!("{message} ({kind})")),
+        (Some(message), None) => Some(message.to_owned()),
+        (None, Some(kind)) => Some(kind.to_owned()),
+        (None, None) => None,
+    }
+}
+
+pub fn format_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = extract_api_error(body).or_else(|| {
+        let trimmed = body.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }).unwrap_or_else(|| "unknown error".to_string());
+    let detail = detail.lines().take(2).collect::<Vec<_>>().join(" ");
+    format!("HTTP {}: {}", status, detail)
+}
+
 pub fn duration_agreement(observed: f64, candidate: Option<f64>) -> f32 {
     let Some(candidate) = candidate.filter(|d| *d > 0.0) else { return 0.5 };
     (1.0 - ((observed - candidate).abs() / 30.0) as f32).clamp(0.0, 1.0)
@@ -271,23 +309,40 @@ pub async fn identify(
             ("duration", &duration),
             ("fingerprint", &fingerprint.fingerprint),
         ])
-        .send().await.context("AcoustID request failed")?
-        .error_for_status().context("AcoustID request was rejected")?;
-    let response: AcoustIdResponse = response.json().await
+        .send().await.context("AcoustID request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("AcoustID request was rejected ({})", format_http_error(status, &body));
+    }
+
+    let response_text = response.text().await
+        .map_err(|_| anyhow::anyhow!("AcoustID returned an unreadable response"))?;
+    let response: AcoustIdResponse = serde_json::from_str(&response_text)
         .map_err(|_| anyhow::anyhow!("AcoustID returned an unreadable response"))?;
     if response.status != "ok" {
-        bail!("AcoustID could not process the lookup");
+        let detail = response.error
+            .as_ref()
+            .and_then(|error| error.message.clone())
+            .or_else(|| response.error.as_ref().and_then(|error| error.kind.clone()))
+            .unwrap_or_else(|| response.status.clone());
+        bail!("AcoustID could not process the lookup: {detail}");
     }
 
     let mut candidates = Vec::new();
     for result in response.results.into_iter().take(5) {
         for recording in result.recordings.into_iter().take(3) {
-            let recording_data: MusicBrainzRecording = client
+            let response = client
                 .get(format!("{MUSICBRAINZ_URL}/{}", recording.id))
                 .query(&[("inc", "artists+releases"), ("fmt", "json")])
-                .send().await.context("MusicBrainz request failed")?
-                .error_for_status().context("MusicBrainz request was rejected")?
-                .json().await.context("MusicBrainz returned an unreadable response")?;
+                .send().await.context("MusicBrainz request failed")?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                bail!("MusicBrainz request was rejected ({})", format_http_error(status, &body));
+            }
+            let recording_data: MusicBrainzRecording = response.json().await
+                .context("MusicBrainz returned an unreadable response")?;
             let artist = recording_data.artist_credit.iter()
                 .map(|credit| credit.name.as_str()).collect::<Vec<_>>().join(", ");
             let release = recording_data.releases.first()
