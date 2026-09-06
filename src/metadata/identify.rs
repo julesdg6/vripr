@@ -271,10 +271,8 @@ pub async fn identify(
             ("duration", &duration),
             ("fingerprint", &fingerprint.fingerprint),
         ])
-        .send().await.map_err(|_| anyhow::anyhow!("AcoustID request failed"))?;
-    if !response.status().is_success() {
-        bail!("AcoustID request was rejected");
-    }
+        .send().await.context("AcoustID request failed")?
+        .error_for_status().context("AcoustID request was rejected")?;
     let response: AcoustIdResponse = response.json().await
         .map_err(|_| anyhow::anyhow!("AcoustID returned an unreadable response"))?;
     if response.status != "ok" {
