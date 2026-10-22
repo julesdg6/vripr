@@ -1230,15 +1230,20 @@ impl VriprApp {
                 "Re-scanning ({} pinned track(s) preserved)…", pinned_tracks.len()
             )));
 
-            let expected = all_tracks.len();
+            let expected = expected_track_count(all_tracks.len());
 
-            let retry_params: &[(f64, f64, f64)] = &[
-                (0.70, 15.0, 0.25),
-                (0.40, 10.0, 0.15),
-                (0.20,  5.0, 0.07),
-                (0.10,  3.0, 0.04),
-                (0.05,  2.0, 0.02),
-            ];
+            if expected.is_none() {
+                let _ = tx.send(WorkerMessage::Log(
+                    "No existing track count — keeping detected regions and using configured detection settings."
+                        .to_string(),
+                ));
+            }
+
+            let retry_params = rescan_retry_params(
+                config.silence_min_duration,
+                config.silence_min_sound_dur,
+                expected,
+            );
 
             let mut best: Vec<crate::audio::DetectedTrack> = Vec::new();
             let det_method = config.detection_method.clone();
@@ -1357,7 +1362,7 @@ impl VriprApp {
                             )));
                         }
                         best = detected;
-                        if found == expected { break; }
+                        if expected == Some(found) { break; }
                     }
                     Ok(Err(e)) => {
                         let _ = tx.send(WorkerMessage::Log(format!("Re-scan failed: {e}")));
@@ -1424,15 +1429,20 @@ impl VriprApp {
                 }
             }
 
-            // If we ended up with more tracks than expected, drop the extras from the tail
-            // (keep pinned tracks if possible — sort first so pinned ones rank by position).
-            if merged.len() > expected {
+            // If we ended up with more tracks than a known expected count, drop extras
+            // from the tail (keep pinned tracks if possible — sort first by position).
+            if let Some(expected) = expected.filter(|&count| merged.len() > count) {
                 merged.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
                 let _ = tx.send(WorkerMessage::Log(format!(
                     "  ⚠ {} merged vs {} expected — discarding {} extra region(s)",
                     merged.len(), expected, merged.len() - expected
                 )));
-                merged.truncate(expected);
+                truncate_to_expected(&mut merged, Some(expected));
+            } else if expected.is_none() {
+                let _ = tx.send(WorkerMessage::Log(format!(
+                    "  ✓ keeping {} detected region(s); expected count is unknown",
+                    merged.len()
+                )));
             }
 
             // Sort by start time and re-assign indices + track numbers
@@ -2312,6 +2322,42 @@ fn parse_mmss(s: &str) -> Option<f64> {
     }
 }
 
+/// The current track table is the source of truth for re-scan calibration.
+///
+/// Zero means no count is known yet, not that the recording contains no tracks.
+/// Keeping that distinction explicit prevents a fresh scan from truncating all
+/// newly detected regions.
+fn expected_track_count(current_track_count: usize) -> Option<usize> {
+    (current_track_count > 0).then_some(current_track_count)
+}
+
+/// Limit detected regions when a trusted expected count is available.
+fn truncate_to_expected<T>(detected: &mut Vec<T>, expected: Option<usize>) {
+    if let Some(expected) = expected {
+        detected.truncate(expected);
+    }
+}
+
+/// Build the scan schedule used by re-scan.
+fn rescan_retry_params(
+    configured_min_silence: f64,
+    configured_min_sound: f64,
+    expected: Option<usize>,
+) -> Vec<(f64, f64, f64)> {
+    if expected.is_none() {
+        let gap_fill = (configured_min_silence * 0.35).min(0.25);
+        return vec![(configured_min_silence, configured_min_sound, gap_fill)];
+    }
+
+    vec![
+        (0.70, 15.0, 0.25),
+        (0.40, 10.0, 0.15),
+        (0.20, 5.0, 0.07),
+        (0.10, 3.0, 0.04),
+        (0.05, 2.0, 0.02),
+    ]
+}
+
 /// Pair a slice of detected audio regions with Discogs track metadata, in order.
 fn pair_detected_with_meta(
     detected: &[crate::audio::DetectedTrack],
@@ -2387,7 +2433,9 @@ fn time_text_edit(
 
 #[cfg(test)]
 mod tests {
-    use super::show_identification_dialog;
+    use super::{
+        expected_track_count, rescan_retry_params, show_identification_dialog, truncate_to_expected,
+    };
     use crate::metadata::identify::IdentificationCandidate;
 
     fn identification_results(track_count: usize) -> Vec<(usize, Vec<IdentificationCandidate>)> {
@@ -2405,6 +2453,35 @@ mod tests {
                 (track_index, vec![candidate.clone(), candidate])
             })
             .collect()
+    }
+
+    #[test]
+    fn empty_track_table_keeps_newly_detected_regions() {
+        let expected = expected_track_count(0);
+        let mut detected = vec![1, 2, 3];
+
+        truncate_to_expected(&mut detected, expected);
+
+        assert_eq!(expected, None);
+        assert_eq!(detected, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn known_track_count_still_truncates_extra_regions() {
+        let expected = expected_track_count(2);
+        let mut detected = vec![1, 2, 3];
+
+        truncate_to_expected(&mut detected, expected);
+
+        assert_eq!(expected, Some(2));
+        assert_eq!(detected, vec![1, 2]);
+    }
+
+    #[test]
+    fn unknown_track_count_uses_configured_detector_settings_once() {
+        let attempts = rescan_retry_params(5.0, 15.0, None);
+
+        assert_eq!(attempts, vec![(5.0, 15.0, 0.25)]);
     }
 
     #[test]
