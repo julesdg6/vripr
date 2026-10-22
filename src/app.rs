@@ -2111,57 +2111,20 @@ impl VriprApp {
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
         if self.identification_open {
-            let mut accepted = Vec::new();
-            let mut close = false;
-            egui::Window::new("Identify Tracks")
-                .open(&mut self.identification_open)
-                .resizable(true)
-                .default_width(620.0)
-                .show(ctx, |ui| {
-                    ui.label("Matches are suggestions only. Accepting replaces only Title and Artist; use the track editor to adjust them.");
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (track_index, candidates) in &self.identification_results {
-                            ui.separator();
-                            ui.strong(format!("Track {track_index}"));
-                            if candidates.is_empty() {
-                                ui.colored_label(egui::Color32::from_rgb(249, 226, 175), "Unmatched or an error occurred — metadata was not changed.");
-                                continue;
-                            }
-                            let best = &candidates[0];
-                            let state = if best.score >= self.config.identification_confidence_threshold {
-                                "High confidence — confirmation required"
-                            } else if candidates.len() > 1 {
-                                "Ambiguous — choose a candidate or reject"
-                            } else {
-                                "Low confidence — confirmation required"
-                            };
-                            ui.label(format!("{state} ({:.0}%)", best.score * 100.0));
-                            for candidate in candidates {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Accept").clicked() {
-                                        accepted.push((*track_index, candidate.clone()));
-                                    }
-                                    ui.label(format!(
-                                        "{} — {}{}  •  {:.0}% fingerprint, {:.0}% duration",
-                                        candidate.artist, candidate.title,
-                                        if candidate.release.is_empty() { String::new() } else { format!(" ({})", candidate.release) },
-                                        candidate.fingerprint_score * 100.0,
-                                        candidate.duration_score * 100.0,
-                                    ));
-                                });
-                            }
-                        }
-                    });
-                    if ui.button("Reject all / Close").clicked() { close = true; }
-                });
-            for (track_index, candidate) in accepted {
+            let response = show_identification_dialog(
+                ctx,
+                &self.identification_results,
+                self.config.identification_confidence_threshold,
+                &mut self.identification_open,
+            );
+            for (track_index, candidate) in response.accepted {
                 if let Some(track) = self.tracks.iter_mut().find(|track| track.index == track_index) {
                     track.title = candidate.title;
                     track.artist = candidate.artist;
                     self.push_log(format!("Accepted identification for track {track_index}."));
                 }
             }
-            if close { self.identification_open = false; }
+            if response.close { self.identification_open = false; }
         }
 
         // Discogs release picker
@@ -2214,6 +2177,87 @@ impl VriprApp {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct IdentificationDialogResponse {
+    accepted: Vec<(usize, IdentificationCandidate)>,
+    close: bool,
+    window_rect: Option<egui::Rect>,
+    close_button_rect: Option<egui::Rect>,
+}
+
+fn show_identification_dialog(
+    ctx: &egui::Context,
+    results: &[(usize, Vec<IdentificationCandidate>)],
+    confidence_threshold: f32,
+    open: &mut bool,
+) -> IdentificationDialogResponse {
+    let mut response = IdentificationDialogResponse::default();
+    let viewport = ctx.screen_rect().shrink(16.0);
+    let default_width = 620.0_f32.min(viewport.width());
+    let default_height = (viewport.height() * 0.8).min(560.0);
+    let window = egui::Window::new("Identify Tracks")
+        .open(open)
+        .resizable(true)
+        .default_size([default_width, default_height])
+        .max_size(viewport.size())
+        .constrain_to(viewport)
+        .show(ctx, |ui| {
+            ui.add(
+                egui::Label::new("Matches are suggestions only. Accepting replaces only Title and Artist; use the track editor to adjust them.")
+                    .wrap(),
+            );
+            let results_height = (ui.available_height() - 32.0).max(80.0);
+            egui::ScrollArea::vertical()
+                .max_height(results_height)
+                .show(ui, |ui| {
+                    for (track_index, candidates) in results {
+                        ui.separator();
+                        ui.strong(format!("Track {track_index}"));
+                        if candidates.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(249, 226, 175),
+                                "Unmatched or an error occurred — metadata was not changed.",
+                            );
+                            continue;
+                        }
+                        let best = &candidates[0];
+                        let state = if best.score >= confidence_threshold {
+                            "High confidence — confirmation required"
+                        } else if candidates.len() > 1 {
+                            "Ambiguous — choose a candidate or reject"
+                        } else {
+                            "Low confidence — confirmation required"
+                        };
+                        ui.label(format!("{state} ({:.0}%)", best.score * 100.0));
+                        for candidate in candidates {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Accept").clicked() {
+                                    response.accepted.push((*track_index, candidate.clone()));
+                                }
+                                ui.add(
+                                    egui::Label::new(format!(
+                                        "{} — {}{}  •  {:.0}% fingerprint, {:.0}% duration",
+                                        candidate.artist, candidate.title,
+                                        if candidate.release.is_empty() { String::new() } else { format!(" ({})", candidate.release) },
+                                        candidate.fingerprint_score * 100.0,
+                                        candidate.duration_score * 100.0,
+                                    ))
+                                    .wrap(),
+                                );
+                            });
+                        }
+                    }
+                });
+            let close = ui.button("Reject all / Close");
+            response.close_button_rect = Some(close.rect);
+            if close.clicked() {
+                response.close = true;
+            }
+        });
+    response.window_rect = window.map(|inner| inner.response.rect);
+    response
 }
 
 impl eframe::App for VriprApp {
@@ -2339,4 +2383,60 @@ fn time_text_edit(
     }
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::show_identification_dialog;
+    use crate::metadata::identify::IdentificationCandidate;
+
+    fn identification_results(track_count: usize) -> Vec<(usize, Vec<IdentificationCandidate>)> {
+        (1..=track_count)
+            .map(|track_index| {
+                let candidate = IdentificationCandidate {
+                    recording_id: format!("recording-{track_index}"),
+                    artist: "An artist with a deliberately long display name".into(),
+                    title: "A song title long enough to exercise constrained layouts".into(),
+                    release: "An unusually verbose single and release hint".into(),
+                    fingerprint_score: 0.95,
+                    duration_score: 0.9,
+                    score: 0.93,
+                };
+                (track_index, vec![candidate.clone(), candidate])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identification_dialog_keeps_close_button_inside_viewport() {
+        let ctx = egui::Context::default();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let results = identification_results(12);
+        let mut open = true;
+        let mut dialog = None;
+
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                dialog = Some(show_identification_dialog(ctx, &results, 0.85, &mut open));
+            });
+        }
+
+        let dialog = dialog.expect("dialog should render");
+        let window_rect = dialog.window_rect.expect("window should have a rectangle");
+        let close_rect = dialog
+            .close_button_rect
+            .expect("close button should have a rectangle");
+        assert!(
+            viewport.contains_rect(window_rect),
+            "dialog {window_rect:?} should fit viewport {viewport:?}"
+        );
+        assert!(
+            viewport.contains_rect(close_rect),
+            "close button {close_rect:?} should fit viewport {viewport:?}"
+        );
+    }
 }
